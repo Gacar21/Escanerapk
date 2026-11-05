@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hoja con esquinas de escáner y línea de lectura -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFDF8"
+        android:pathData="M42,36 L66,36 L66,72 L42,72 Z" />
+    <path android:fillColor="#C9C2EF" android:pathData="M46,44 h16 v2.5 h-16 z M46,50 h16 v2.5 h-16 z M46,62 h11 v2.5 h-11 z" />
+    <path android:fillColor="#5EE0F5" android:pathData="M36,55.5 h36 v3 h-36 z" />
+    <path android:strokeColor="#9C90F0" android:strokeWidth="3.5" android:strokeLineCap="round" android:fillColor="#00000000"
+        android:pathData="M33,40 V31 H42 M66,31 H75 V40 M75,68 V77 H66 M42,77 H33 V68" />
+</vector>
