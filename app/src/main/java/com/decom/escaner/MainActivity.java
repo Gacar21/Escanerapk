@@ -1,5 +1,6 @@
 package com.decom.escaner;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
@@ -7,12 +8,15 @@ import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.Base64;
+import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.PermissionRequest;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -49,6 +53,10 @@ public class MainActivity extends Activity {
     private static final String FOLDER = "Escaner DECOM";
     private static final int REQ_CAMERA = 51;
     private static final int REQ_GALLERY = 52;
+    private static final int REQ_PERM_CAMERA = 61;
+
+    // Pedido de cámara de la página que espera el permiso de Android
+    private PermissionRequest pendingWebPermission;
 
     private static final Map<String, String> CONTENT_TYPES = new HashMap<>();
     static {
@@ -110,6 +118,28 @@ public class MainActivity extends Activity {
             }
         });
         webView.setWebChromeClient(new WebChromeClient() {
+            /** La cámara dentro de la app (getUserMedia) pide permiso aquí. */
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                runOnUiThread(() -> {
+                    boolean video = false;
+                    for (String r : request.getResources()) {
+                        if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) video = true;
+                    }
+                    if (!video) {
+                        request.deny();
+                        return;
+                    }
+                    if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                        request.grant(new String[]{PermissionRequest.RESOURCE_VIDEO_CAPTURE});
+                    } else {
+                        if (pendingWebPermission != null) pendingWebPermission.deny();
+                        pendingWebPermission = request;
+                        requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_PERM_CAMERA);
+                    }
+                });
+            }
+
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
                 if (fileCallback != null) fileCallback.onReceiveValue(null);
@@ -188,6 +218,18 @@ public class MainActivity extends Activity {
         }
         fileCallback.onReceiveValue(result);
         fileCallback = null;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_PERM_CAMERA || pendingWebPermission == null) return;
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            pendingWebPermission.grant(new String[]{PermissionRequest.RESOURCE_VIDEO_CAPTURE});
+        } else {
+            pendingWebPermission.deny();
+        }
+        pendingWebPermission = null;
     }
 
     /* ---------------- imágenes compartidas desde otras apps ---------------- */
@@ -367,6 +409,15 @@ public class MainActivity extends Activity {
                 } catch (ActivityNotFoundException e) {
                     toast("No hay una app para abrir este archivo");
                 }
+            });
+        }
+
+        /** Mantiene la pantalla encendida mientras la cámara está abierta. */
+        @JavascriptInterface
+        public void keepScreenOn(boolean on) {
+            runOnUiThread(() -> {
+                if (on) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             });
         }
 

@@ -1,11 +1,12 @@
-import { detectDocument, defaultQuad, outputSize, warpPerspective, applyFilter, rotateImage, FILTERS } from './scan.js';
+import { defaultQuad, FILTERS } from './scan.js';
 import * as store from './store.js';
 
 const native = window.Android || null;
 const $ = (id) => document.getElementById(id);
 
 const MAX_SOURCE = 3000;   // lado mayor de la foto con la que se trabaja
-const DETECT_SIZE = 500;   // lado mayor para detectar la hoja
+const LIVE_SIZE = 320;     // lado mayor de los cuadros de la vista en vivo que se analizan
+const PREVIEW_SIDE = 900;  // vista previa inmediata al cambiar de filtro
 const MAX_OUTPUT = 2400;   // lado mayor de la página escaneada (≈ 290 ppp en A4)
 const JPEG_QUALITY = 0.88;
 const FILTER_KEY = 'escaner.filtro';
@@ -15,7 +16,7 @@ try { filterPref = localStorage.getItem(FILTER_KEY) || 'mejorado'; } catch { /* 
 
 /* =================== utilidades de interfaz =================== */
 
-const SCREENS = ['home', 'crop', 'enhance', 'doc'];
+const SCREENS = ['home', 'camera', 'crop', 'enhance', 'doc'];
 const show = (id) => SCREENS.forEach((s) => ($(s).hidden = s !== id));
 const current = () => SCREENS.find((s) => !$(s).hidden);
 
@@ -127,28 +128,66 @@ const rotateCanvas = (canvas, quarterTurns) => {
   return c;
 };
 
-/** Busca la hoja en la foto; si no la encuentra devuelve null. */
-function autoQuad(canvas) {
-  const small = scaled(canvas, DETECT_SIZE);
-  const q = detectDocument(canvasData(small));
-  if (!q) return null;
-  const k = canvas.width / small.width;
-  // se mete cada esquina un poco hacia el centro para no dejar bordes del fondo
-  const pts = q.map((p) => ({ x: p.x * k, y: p.y * k }));
-  const cx = pts.reduce((s, p) => s + p.x, 0) / 4, cy = pts.reduce((s, p) => s + p.y, 0) / 4;
-  const inset = Math.hypot(canvas.width, canvas.height) * 0.007;
-  return pts.map((p) => {
-    const d = Math.hypot(cx - p.x, cy - p.y) || 1;
-    return { x: p.x + ((cx - p.x) / d) * inset, y: p.y + ((cy - p.y) / d) * inset };
-  });
+/* =================== procesamiento en segundo plano =================== */
+
+function makeWorker() {
+  const w = new Worker('processor.js', { type: 'module' });
+  const pending = new Map();
+  let seq = 0;
+  w.onmessage = ({ data }) => {
+    const p = pending.get(data.id);
+    if (!p) return;
+    pending.delete(data.id);
+    if (data.error) p.reject(new Error(data.error));
+    else p.resolve(data);
+  };
+  w.onerror = (e) => {
+    pending.forEach((p) => p.reject(new Error(e.message || 'Error en el procesamiento')));
+    pending.clear();
+  };
+  return {
+    call(msg, transfer = []) {
+      return new Promise((resolve, reject) => {
+        const id = ++seq;
+        pending.set(id, { resolve, reject });
+        w.postMessage({ ...msg, id }, transfer);
+      });
+    },
+    get busy() {
+      return pending.size > 0;
+    },
+  };
 }
 
-/** Endereza y aplica el filtro; devuelve un canvas con la página final. */
-function renderPage(srcCanvas, quad, filter, rotation, maxSide = MAX_OUTPUT) {
-  const size = outputSize(quad, maxSide, srcCanvas.width, srcCanvas.height);
-  const warped = warpPerspective(canvasData(srcCanvas), quad, size.width, size.height);
-  return imageDataToCanvas(rotateImage(applyFilter(warped, filter), rotation));
+const proc = makeWorker();     // trabajo pesado: enderezar, filtros, JPG
+const quick = makeWorker();    // vistas previas al instante (copia liviana de la foto)
+const liveDet = makeWorker();  // detección en la vista de la cámara
+
+/** Envía la foto a los trabajadores (una sola vez por foto). */
+function sendSource(key, canvas, withPreview = key === 'edit') {
+  const img = canvasData(canvas);
+  const jobs = [];
+  if (withPreview) {
+    const copy = canvasData(canvas);
+    jobs.push(quick.call({ op: 'setSource', key, image: copy, maxSide: 1400 }, [copy.data.buffer]));
+  }
+  jobs.push(proc.call({ op: 'setSource', key, image: img }, [img.data.buffer]));
+  return Promise.all(jobs);
 }
+
+/** Detecta la hoja en la foto enviada; devuelve las esquinas o null. */
+async function detectSource(key) {
+  const r = await proc.call({ op: 'detectSource', key });
+  return r.quad;
+}
+
+/** Página final en JPG (más su miniatura). */
+const renderBlobs = (key, quad, filter, rotation) =>
+  proc.call({ op: 'render', key, quad, filter, rotation, maxSide: MAX_OUTPUT, blobs: true });
+
+/** Imagen procesada (ImageData) de tamaño reducido, para vistas previas. */
+const renderImage = (key, quad, filter, rotation, maxSide) =>
+  quick.call({ op: 'render', key, quad, filter, rotation, maxSide }).then((r) => r.image);
 
 /* =================== edición de una página =================== */
 
@@ -156,8 +195,7 @@ let edit = null; // { doc, page, canvas, srcBlob, quad, detected, rotation, filt
 let captureTarget = null; // documento al que se agregan las páginas nuevas
 
 function startCapture(doc = null) {
-  captureTarget = doc;
-  $('camInput').click();
+  openCamera(doc);
 }
 
 function startImport(doc = null) {
@@ -180,11 +218,12 @@ $('camInput').addEventListener('change', async (e) => {
   try {
     await nextFrame();
     const { canvas, srcBlob } = await prepareSource(file);
-    const detected = autoQuad(canvas);
+    await sendSource('edit', canvas);
+    const detected = await detectSource('edit');
     edit = {
       doc: captureTarget, page: null, canvas, srcBlob,
       quad: detected || defaultQuad(canvas.width, canvas.height),
-      detected, rotation: 0, filter: filterPref,
+      detected, rotation: 0, filter: filterPref, sourceSent: true,
     };
     busy(null);
     openCrop();
@@ -210,25 +249,35 @@ $('galleryInput').addEventListener('change', async (e) => {
   await importMany(files, captureTarget);
 });
 
-/** Importa varias fotos de una vez: detecta, endereza y mejora cada una automáticamente. */
-async function importMany(blobs, doc) {
+/**
+ * Procesa varias fotos de una vez (ráfaga de la cámara o galería):
+ * detecta la hoja, endereza y aplica el filtro a cada una, en segundo plano.
+ * `items` son { blob, quad? }.
+ */
+async function processMany(items, doc, verb = 'Escaneando') {
   doc = doc || (await createDoc());
-  try {
-    for (let i = 0; i < blobs.length; i++) {
-      busy(`Escaneando ${i + 1} de ${blobs.length}…`);
-      await nextFrame();
-      const { canvas, srcBlob } = await prepareSource(blobs[i]);
-      const quad = autoQuad(canvas) || defaultQuad(canvas.width, canvas.height, 0);
-      const out = renderPage(canvas, quad, filterPref, 0);
-      await persistPage(doc, null, { srcBlob, quad, filter: filterPref, rotation: 0, outCanvas: out });
+  let failed = 0;
+  for (let i = 0; i < items.length; i++) {
+    busy(`${verb} ${i + 1} de ${items.length}…`);
+    try {
+      const { canvas, srcBlob } = await prepareSource(items[i].blob);
+      await sendSource('lote', canvas);
+      const quad = items[i].quad || (await detectSource('lote')) || defaultQuad(canvas.width, canvas.height, 0);
+      const out = await renderBlobs('lote', quad, filterPref, 0);
+      await persistPage(doc, null, { srcBlob, quad, filter: filterPref, rotation: 0, out });
+    } catch (err) {
+      console.error(err);
+      failed++;
     }
-  } catch (err) {
-    toast(err.message || 'Algunas fotos no se pudieron procesar');
   }
+  proc.call({ op: 'dropSource', key: 'lote' });
   busy(null);
-  openDoc(doc);
-  toast(`${blobs.length} páginas agregadas. Toca una para ajustarla.`);
+  await openDoc(doc);
+  const ok = items.length - failed;
+  toast(failed ? `${ok} de ${items.length} páginas listas; algunas fotos no se pudieron procesar` : `${ok} páginas listas. Toca una para ajustarla.`);
 }
+
+const importMany = (blobs, doc) => processMany(blobs.map((blob) => ({ blob })), doc);
 
 // Fotos compartidas hacia la app desde la galería u otra app
 window.onSharedImages = async (urls) => {
@@ -246,17 +295,17 @@ async function createDoc() {
   return doc;
 }
 
-async function persistPage(doc, existing, { srcBlob, quad, filter, rotation, outCanvas }) {
+async function persistPage(doc, existing, { srcBlob, quad, filter, rotation, out }) {
   const page = existing || { id: store.newId(), docId: doc.id };
   Object.assign(page, {
     src: srcBlob,
     quad: quad.map((p) => ({ x: p.x, y: p.y })),
     filter,
     rotation,
-    out: await canvasToBlob(outCanvas),
-    thumb: await canvasToBlob(scaled(outCanvas, 420), 'image/jpeg', 0.8),
-    width: outCanvas.width,
-    height: outCanvas.height,
+    out: out.blob,
+    thumb: out.thumb,
+    width: out.width,
+    height: out.height,
   });
   await store.savePage(doc, page);
   return page;
@@ -434,6 +483,7 @@ $('btnCropRotate').addEventListener('click', () => {
   edit.quad = orderClockwise(edit.quad.map(rot));
   if (edit.detected) edit.detected = orderClockwise(edit.detected.map(rot));
   edit.srcDirty = true;
+  edit.sourceSent = false;
   layoutCrop();
 });
 
@@ -471,58 +521,102 @@ window.addEventListener('resize', () => {
 });
 
 /* =================== pantalla de mejora =================== */
+//
+// Rápida: al cambiar de filtro se muestra al instante una vista previa reducida y la
+// versión final en alta resolución se prepara en segundo plano.
 
 let previewUrl = null;
+let renderToken = 0;
+
+const resultKey = () => `${edit.filter}|${edit.rotation}|${edit.quad.map((p) => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(';')}`;
 
 async function openEnhance() {
   show('enhance');
   $('enhanceBusy').hidden = false;
-  await nextFrame();
-  const size = outputSize(edit.quad, MAX_OUTPUT, edit.canvas.width, edit.canvas.height);
-  edit.warped = warpPerspective(canvasData(edit.canvas), edit.quad, size.width, size.height);
-  edit.filtered = null;
+  if (!edit.sourceSent) {
+    await sendSource('edit', edit.canvas);
+    edit.sourceSent = true;
+  }
+  edit.results = new Map(); // clave -> promesa de { blob, thumb, width, height }
   buildChips();
   await renderEnhance();
 }
 
-function buildChips() {
+const imageToUrl = async (img) => {
+  const c = imageDataToCanvas(img);
+  return URL.createObjectURL(await canvasToBlob(c, 'image/jpeg', 0.85));
+};
+
+function setPreview(url) {
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = url;
+  $('enhancePreview').src = url;
+}
+
+async function buildChips() {
   const box = $('filterChips');
   box.replaceChildren();
-  const small = scaled(imageDataToCanvas(edit.warped), 200);
-  for (const f of FILTERS) {
+  const chips = FILTERS.map((f) => {
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'chip' + (f.id === edit.filter ? ' on' : '');
     chip.dataset.filter = f.id;
     const img = document.createElement('img');
     img.alt = '';
-    img.src = imageDataToCanvas(applyFilter(canvasData(small), f.id)).toDataURL('image/jpeg', 0.8);
     const label = document.createElement('span');
     label.textContent = f.label;
     chip.append(img, label);
     chip.addEventListener('click', async () => {
       if (edit.filter === f.id) return;
       edit.filter = f.id;
-      edit.filtered = null;
       filterPref = f.id;
       try { localStorage.setItem(FILTER_KEY, f.id); } catch { /* sin almacenamiento */ }
       box.querySelectorAll('.chip').forEach((c) => c.classList.toggle('on', c === chip));
       await renderEnhance();
     });
     box.appendChild(chip);
+    return { chip, img, id: f.id };
+  });
+  // miniaturas de cada filtro, pequeñas y rápidas
+  const token = edit;
+  for (const c of chips) {
+    try {
+      const img = await renderImage('edit', edit.quad, c.id, 0, 160);
+      if (edit !== token) return;
+      c.img.src = imageDataToCanvas(img).toDataURL('image/jpeg', 0.8);
+    } catch { /* la miniatura no es esencial */ }
   }
 }
 
+/** Resultado final (alta resolución) para el filtro y giro actuales, calculado una sola vez. */
+function finalResult() {
+  const key = resultKey();
+  if (!edit.results.has(key)) edit.results.set(key, renderBlobs('edit', edit.quad, edit.filter, edit.rotation));
+  return edit.results.get(key);
+}
+
 async function renderEnhance() {
+  const token = ++renderToken;
+  const e = edit;
   $('enhanceBusy').hidden = false;
-  await nextFrame();
-  if (!edit.filtered) edit.filtered = applyFilter(edit.warped, edit.filter);
-  edit.result = imageDataToCanvas(rotateImage(edit.filtered, edit.rotation));
-  const blob = await canvasToBlob(edit.result, 'image/jpeg', 0.9);
-  if (previewUrl) URL.revokeObjectURL(previewUrl);
-  previewUrl = URL.createObjectURL(blob);
-  $('enhancePreview').src = previewUrl;
-  $('enhanceBusy').hidden = true;
+  try {
+    // 1) vista previa inmediata
+    const quick = await renderImage('edit', e.quad, e.filter, e.rotation, PREVIEW_SIDE);
+    if (token !== renderToken || e !== edit) return;
+    setPreview(await imageToUrl(quick));
+    $('enhancePreview').classList.add('soft');
+    $('enhanceBusy').hidden = true;
+    // 2) alta resolución en segundo plano
+    const full = await finalResult();
+    if (token !== renderToken || e !== edit) return;
+    setPreview(URL.createObjectURL(full.blob));
+    $('enhancePreview').classList.remove('soft');
+  } catch (err) {
+    if (token === renderToken) {
+      $('enhanceBusy').hidden = true;
+      toast('No se pudo procesar: ' + err.message);
+    }
+  }
 }
 
 $('btnEnhanceRotate').addEventListener('click', async () => {
@@ -534,14 +628,14 @@ $('btnEnhanceBack').addEventListener('click', () => openCrop());
 
 async function saveCurrentEdit() {
   busy('Guardando…');
-  await nextFrame();
+  const out = await finalResult();
   const doc = edit.doc || (await createDoc());
   await persistPage(doc, edit.page, {
     srcBlob: edit.srcBlob,
     quad: edit.quad,
     filter: edit.filter,
     rotation: edit.rotation,
-    outCanvas: edit.result,
+    out,
   });
   busy(null);
   return doc;
@@ -568,6 +662,240 @@ $('btnScanMore').addEventListener('click', async () => {
     busy(null);
     toast('No se pudo guardar: ' + (err.message || err));
   }
+});
+
+/* =================== cámara en vivo =================== */
+
+const cam = { stream: null, track: null, imageCapture: null, shots: [], quad: null, quadView: null, steady: 0, timer: null, torch: false, doc: null };
+
+async function openCamera(doc) {
+  cam.doc = doc;
+  cam.shots = [];
+  cam.quad = null;
+  cam.steady = 0;
+  updateCamBar();
+  $('camSvg').innerHTML = '';
+  $('camHint').textContent = 'Abriendo cámara…';
+  $('camHint').classList.remove('ready');
+  show('camera');
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('sin cámara');
+    cam.stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+    });
+  } catch (err) {
+    console.warn(err);
+    closeCamera(false);
+    toast('No se pudo abrir la cámara aquí; se abrirá la del teléfono');
+    captureTarget = doc;
+    $('camInput').click();
+    return;
+  }
+  const video = $('camVideo');
+  video.srcObject = cam.stream;
+  try { await video.play(); } catch { /* se reproducirá al tocar */ }
+  cam.track = cam.stream.getVideoTracks()[0];
+  const caps = cam.track.getCapabilities ? cam.track.getCapabilities() : {};
+  if (caps.focusMode && caps.focusMode.includes('continuous')) {
+    cam.track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
+  }
+  cam.torch = false;
+  $('btnTorch').hidden = !caps.torch;
+  $('btnTorch').classList.remove('on');
+  cam.imageCapture = null;
+  if (window.ImageCapture) {
+    try {
+      const ic = new ImageCapture(cam.track);
+      const pc = await ic.getPhotoCapabilities();
+      // solo vale la pena si la foto es bastante más grande que el video
+      if (pc && pc.imageWidth && pc.imageWidth.max > (cam.track.getSettings().width || 0) * 1.3) cam.imageCapture = ic;
+    } catch { /* sin foto de alta resolución: se usa el cuadro del video */ }
+  }
+  native && native.keepScreenOn && native.keepScreenOn(true);
+  $('camHint').textContent = 'Apunta a la hoja';
+  liveLoop();
+}
+
+function closeCamera(goBack = true) {
+  clearTimeout(cam.timer);
+  cam.timer = null;
+  if (cam.stream) cam.stream.getTracks().forEach((t) => t.stop());
+  cam.stream = null;
+  cam.track = null;
+  $('camVideo').srcObject = null;
+  native && native.keepScreenOn && native.keepScreenOn(false);
+  if (goBack) {
+    if (cam.doc) openDoc(cam.doc);
+    else goHome();
+  }
+}
+
+/** Relación entre el video y la pantalla (el video se muestra recortado para llenarla). */
+function videoView() {
+  const v = $('camVideo');
+  const W = v.clientWidth, H = v.clientHeight, vw = v.videoWidth, vh = v.videoHeight;
+  const scale = Math.max(W / vw, H / vh);
+  return { scale, ox: (W - vw * scale) / 2, oy: (H - vh * scale) / 2, W, H, vw, vh };
+}
+
+/** Analiza la vista en vivo ~3 veces por segundo y dibuja el contorno de la hoja. */
+async function liveLoop() {
+  if (!cam.stream) return;
+  const v = $('camVideo');
+  if (v.videoWidth && !liveDet.busy) {
+    const s = LIVE_SIZE / Math.max(v.videoWidth, v.videoHeight);
+    const c = document.createElement('canvas');
+    c.width = Math.round(v.videoWidth * s);
+    c.height = Math.round(v.videoHeight * s);
+    c.getContext('2d', { willReadFrequently: true }).drawImage(v, 0, 0, c.width, c.height);
+    try {
+      const { quad } = await liveDet.call({ op: 'detect', image: canvasData(c) });
+      if (cam.stream) updateLiveQuad(quad ? quad.map((p) => ({ x: p.x / s, y: p.y / s })) : null);
+    } catch { /* se intenta de nuevo en el siguiente cuadro */ }
+  }
+  if (cam.stream) cam.timer = setTimeout(liveLoop, 280);
+}
+
+function updateLiveQuad(q) {
+  const svg = $('camSvg');
+  const hint = $('camHint');
+  if (!q) {
+    cam.quad = null;
+    cam.steady = 0;
+    svg.innerHTML = '';
+    hint.textContent = 'Apunta a la hoja';
+    hint.classList.remove('ready');
+    return;
+  }
+  // suavizado y medida de estabilidad
+  const diag = Math.hypot($('camVideo').videoWidth, $('camVideo').videoHeight);
+  const moved = cam.quad ? Math.max(...q.map((p, i) => Math.hypot(p.x - cam.quad[i].x, p.y - cam.quad[i].y))) / diag : 1;
+  cam.steady = moved < 0.02 ? cam.steady + 1 : 0;
+  cam.quad = cam.quad && moved < 0.08 ? q.map((p, i) => ({ x: cam.quad[i].x * 0.4 + p.x * 0.6, y: cam.quad[i].y * 0.4 + p.y * 0.6 })) : q;
+  const vv = videoView();
+  svg.setAttribute('viewBox', `0 0 ${vv.W} ${vv.H}`);
+  const pts = cam.quad.map((p) => `${(vv.ox + p.x * vv.scale).toFixed(1)},${(vv.oy + p.y * vv.scale).toFixed(1)}`).join(' ');
+  svg.innerHTML = `<polygon class="${cam.steady >= 2 ? 'steady' : ''}" points="${pts}"/>`;
+  hint.textContent = cam.steady >= 2 ? 'Listo, toma la foto' : 'Mantén el teléfono quieto';
+  hint.classList.toggle('ready', cam.steady >= 2);
+}
+
+async function takeShot() {
+  if (!cam.stream) return;
+  const v = $('camVideo');
+  if (!v.videoWidth) return;
+  const flash = $('camFlash');
+  flash.classList.remove('go');
+  void flash.offsetWidth;
+  flash.classList.add('go');
+  $('btnShutter').disabled = true;
+  try {
+    let blob = null, quad = null;
+    if (cam.imageCapture) {
+      try {
+        blob = await cam.imageCapture.takePhoto();
+      } catch { blob = null; }
+    }
+    if (!blob) {
+      const c = document.createElement('canvas');
+      c.width = v.videoWidth;
+      c.height = v.videoHeight;
+      c.getContext('2d').drawImage(v, 0, 0);
+      blob = await canvasToBlob(c, 'image/jpeg', 0.92);
+      // el contorno de la vista en vivo sirve directo para esta foto
+      if (cam.quad && cam.steady >= 1) quad = cam.quad.map((p) => ({ ...p }));
+    }
+    // miniatura para la pila de fotos
+    const thumb = document.createElement('canvas');
+    const ts = 160 / Math.max(v.videoWidth, v.videoHeight);
+    thumb.width = Math.round(v.videoWidth * ts);
+    thumb.height = Math.round(v.videoHeight * ts);
+    thumb.getContext('2d').drawImage(v, 0, 0, thumb.width, thumb.height);
+    cam.shots.push({ blob, quad, thumb: thumb.toDataURL('image/jpeg', 0.7) });
+    updateCamBar(true);
+  } catch (err) {
+    toast('No se pudo tomar la foto');
+  } finally {
+    $('btnShutter').disabled = false;
+  }
+}
+
+function updateCamBar(bump = false) {
+  const n = cam.shots.length;
+  $('camCount').textContent = n;
+  $('camCount').hidden = n === 0;
+  const last = cam.shots[n - 1];
+  if (last) $('camLastShot').src = last.thumb;
+  else $('camLastShot').removeAttribute('src');
+  $('btnCamDone').disabled = n === 0;
+  $('btnCamDone').textContent = n > 1 ? `Listo (${n})` : 'Listo';
+  if (bump) {
+    const t = $('btnCamThumbs');
+    t.classList.remove('bump');
+    void t.offsetWidth;
+    t.classList.add('bump');
+  }
+}
+
+$('btnShutter').addEventListener('click', takeShot);
+
+$('btnTorch').addEventListener('click', async () => {
+  if (!cam.track) return;
+  cam.torch = !cam.torch;
+  try {
+    await cam.track.applyConstraints({ advanced: [{ torch: cam.torch }] });
+    $('btnTorch').classList.toggle('on', cam.torch);
+  } catch {
+    cam.torch = false;
+    toast('El flash no está disponible');
+  }
+});
+
+$('btnCamThumbs').addEventListener('click', async () => {
+  if (!cam.shots.length) return;
+  if (await ask(`¿Borrar la última foto? (${cam.shots.length} tomada${cam.shots.length === 1 ? '' : 's'})`, 'Borrar', 'Seguir')) {
+    cam.shots.pop();
+    updateCamBar();
+  }
+});
+
+$('btnCamClose').addEventListener('click', () => leaveCamera());
+
+async function leaveCamera() {
+  if (cam.shots.length && !(await ask(`¿Descartar ${cam.shots.length} foto${cam.shots.length === 1 ? '' : 's'}?`, 'Descartar', 'Seguir'))) return;
+  cam.shots = [];
+  closeCamera(true);
+}
+
+$('btnCamDone').addEventListener('click', async () => {
+  const shots = cam.shots;
+  const doc = cam.doc;
+  cam.shots = [];
+  closeCamera(false);
+  if (shots.length === 1) {
+    // una sola foto: se revisa con calma (recorte + filtro)
+    busy('Preparando la foto…');
+    try {
+      const { canvas, srcBlob } = await prepareSource(shots[0].blob);
+      await sendSource('edit', canvas);
+      const detected = shots[0].quad || (await detectSource('edit'));
+      edit = {
+        doc, page: null, canvas, srcBlob,
+        quad: detected || defaultQuad(canvas.width, canvas.height),
+        detected, rotation: 0, filter: filterPref, sourceSent: true,
+      };
+      busy(null);
+      openCrop();
+    } catch (err) {
+      busy(null);
+      toast(err.message || 'No se pudo usar la foto');
+      if (doc) openDoc(doc); else goHome();
+    }
+    return;
+  }
+  // varias fotos: se procesan todas y luego se revisan en el documento
+  await processMany(shots, doc, 'Mejorando');
 });
 
 /* =================== documento =================== */
@@ -642,8 +970,9 @@ function openPageSheet(page, index, total) {
 const closeSheets = () => {
   $('pageSheet').hidden = true;
   $('exportSheet').hidden = true;
+  $('filterSheet').hidden = true;
 };
-['pageSheet', 'exportSheet'].forEach((id) =>
+['pageSheet', 'exportSheet', 'filterSheet'].forEach((id) =>
   $(id).addEventListener('click', (e) => {
     if (e.target === $(id)) closeSheets();
   }),
@@ -662,7 +991,7 @@ $('pageSheet').addEventListener('click', async (e) => {
       edit = {
         doc, page, canvas, srcBlob: page.src,
         quad: page.quad.map((p) => ({ ...p })),
-        detected: null, rotation: page.rotation || 0, filter: page.filter || filterPref,
+        detected: null, rotation: page.rotation || 0, filter: page.filter || filterPref, sourceSent: false,
       };
       busy(null);
       openCrop();
@@ -671,7 +1000,13 @@ $('pageSheet').addEventListener('click', async (e) => {
     case 'rotate': {
       busy('Girando…');
       const outCanvas = rotateCanvas(await blobToCanvas(page.out), 1);
-      await persistPage(doc, page, { srcBlob: page.src, quad: page.quad, filter: page.filter, rotation: ((page.rotation || 0) + 1) % 4, outCanvas });
+      const out = {
+        blob: await canvasToBlob(outCanvas),
+        thumb: await canvasToBlob(scaled(outCanvas, 420), 'image/jpeg', 0.8),
+        width: outCanvas.width,
+        height: outCanvas.height,
+      };
+      await persistPage(doc, page, { srcBlob: page.src, quad: page.quad, filter: page.filter, rotation: ((page.rotation || 0) + 1) % 4, out });
       busy(null);
       await renderPages();
       break;
@@ -693,6 +1028,46 @@ $('pageSheet').addEventListener('click', async (e) => {
     default:
   }
 });
+
+/* =================== filtro para todas las páginas =================== */
+
+$('btnFilterAll').addEventListener('click', () => {
+  const list = $('filterAllList');
+  list.replaceChildren();
+  for (const f of FILTERS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'sheet-item';
+    b.textContent = f.label + (f.id === filterPref ? '  ·  actual' : '');
+    b.addEventListener('click', () => applyFilterToAll(f.id));
+    list.appendChild(b);
+  }
+  $('filterSheet').hidden = false;
+});
+
+async function applyFilterToAll(filter) {
+  closeSheets();
+  filterPref = filter;
+  try { localStorage.setItem(FILTER_KEY, filter); } catch { /* sin almacenamiento */ }
+  const doc = currentDoc;
+  const pages = await store.getPages(doc);
+  for (let i = 0; i < pages.length; i++) {
+    busy(`Aplicando filtro ${i + 1} de ${pages.length}…`);
+    const page = pages[i];
+    try {
+      const canvas = await blobToCanvas(page.src);
+      await sendSource('lote', canvas);
+      const out = await renderBlobs('lote', page.quad, filter, page.rotation || 0);
+      await persistPage(doc, page, { srcBlob: page.src, quad: page.quad, filter, rotation: page.rotation || 0, out });
+    } catch (err) {
+      console.error(err);
+    }
+  }
+  proc.call({ op: 'dropSource', key: 'lote' });
+  busy(null);
+  await renderPages();
+  toast('Filtro aplicado a todas las páginas');
+}
 
 /* =================== exportar =================== */
 
@@ -855,12 +1230,15 @@ window.handleBack = () => {
     closeDialog(false);
     return true;
   }
-  if (!$('pageSheet').hidden || !$('exportSheet').hidden) {
+  if (!$('pageSheet').hidden || !$('exportSheet').hidden || !$('filterSheet').hidden) {
     closeSheets();
     return true;
   }
   if (!$('busyOverlay').hidden) return true;
   switch (current()) {
+    case 'camera':
+      leaveCamera();
+      return true;
     case 'enhance':
       openCrop();
       return true;

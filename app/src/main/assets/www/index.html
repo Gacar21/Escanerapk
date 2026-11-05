@@ -43,6 +43,32 @@
     </section>
   </main>
 
+  <!-- ============ CÁMARA ============ -->
+  <section id="camera" class="screen dark" hidden>
+    <div id="camStage" class="cam-stage">
+      <video id="camVideo" playsinline muted autoplay></video>
+      <svg id="camSvg" class="cam-svg"></svg>
+      <div id="camFlash" class="cam-flash"></div>
+      <div class="cam-top">
+        <button id="btnCamClose" class="icon glass" type="button" aria-label="Cerrar cámara">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+        </button>
+        <p id="camHint" class="cam-hint">Apunta a la hoja</p>
+        <button id="btnTorch" class="icon glass" type="button" aria-label="Flash" hidden>
+          <svg viewBox="0 0 24 24"><path d="M13 2L5 14h6l-1 8 8-12h-6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </div>
+    <footer class="cam-bar">
+      <button id="btnCamThumbs" class="cam-thumbs" type="button" aria-label="Fotos tomadas">
+        <img id="camLastShot" alt="">
+        <span id="camCount" class="cam-count">0</span>
+      </button>
+      <button id="btnShutter" class="shutter" type="button" aria-label="Tomar foto"><span></span></button>
+      <button id="btnCamDone" class="cam-done" type="button" disabled>Listo</button>
+    </footer>
+  </section>
+
   <!-- ============ RECORTE ============ -->
   <section id="crop" class="screen dark" hidden>
     <header class="bar dark">
@@ -121,6 +147,10 @@
         <svg viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 16l5-5 4 4 3-3 5 5"/></g></svg>
         <span>Galería</span>
       </button>
+      <button id="btnFilterAll" class="tray-btn light" type="button">
+        <svg viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 4.6L18 9l-4.2 1.4L12 15l-1.8-4.6L6 9l4.2-1.4z"/><path d="M18.5 15l.8 2 2 .7-2 .8-.8 2-.7-2-2-.8 2-.7z"/></g></svg>
+        <span>Filtro</span>
+      </button>
       <button id="btnExport" class="btn-primary" type="button">
         <svg viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></g></svg>
         Exportar
@@ -140,6 +170,15 @@
         <button class="sheet-item" data-act="right" type="button">Mover hacia adelante</button>
         <button class="sheet-item danger" data-act="delete" type="button">Eliminar página</button>
       </div>
+    </div>
+  </div>
+
+  <div id="filterSheet" class="sheet-backdrop" hidden>
+    <div class="sheet">
+      <div class="sheet-grip"></div>
+      <p class="sheet-title">Filtro para todas las páginas</p>
+      <p class="sheet-sub">Se aplica a cada página del documento.</p>
+      <div id="filterAllList" class="sheet-list"></div>
     </div>
   </div>
 
