@@ -324,3 +324,6 @@ button:disabled { opacity: .45; pointer-events: none; }
 }
 .cam-done:disabled { background: #333; color: #888; opacity: 1; }
 .preview.soft { filter: drop-shadow(0 6px 18px rgba(0,0,0,.5)) blur(.4px); }
+
+/* enlace para usar la cámara propia en vez del escáner de Google */
+.own-camera { align-self: center; margin-top: -4px; font-size: 14px; }

@@ -8,6 +8,7 @@ import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.IntentSender;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
@@ -27,6 +28,11 @@ import android.webkit.WebViewClient;
 import android.widget.Toast;
 
 import androidx.core.content.FileProvider;
+
+import com.google.mlkit.common.MlKitException;
+import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions;
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanning;
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult;
 
 import org.json.JSONArray;
 
@@ -53,6 +59,10 @@ public class MainActivity extends Activity {
     private static final String FOLDER = "Escaner DECOM";
     private static final int REQ_CAMERA = 51;
     private static final int REQ_GALLERY = 52;
+    private static final int REQ_GOOGLE_SCAN = 53;
+
+    // Páginas que entregó el escáner de Google (se sirven en /escaneo/N)
+    private final List<Uri> scanUris = new ArrayList<>();
     private static final int REQ_PERM_CAMERA = 61;
 
     // Pedido de cámara de la página que espera el permiso de Android
@@ -201,6 +211,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_GOOGLE_SCAN) {
+            handleGoogleScan(resultCode, data);
+            return;
+        }
         if (fileCallback == null) return;
         Uri[] result = null;
         if (resultCode == RESULT_OK) {
@@ -230,6 +244,70 @@ public class MainActivity extends Activity {
             pendingWebPermission.deny();
         }
         pendingWebPermission = null;
+    }
+
+    /* ---------------- escáner de documentos de Google ---------------- */
+
+    /**
+     * Abre el escáner de Google: detecta la hoja con IA, toma la foto sola,
+     * recorta, endereza y permite varias páginas. Lo descarga Google Play services.
+     */
+    private void launchGoogleScanner() {
+        try {
+            GmsDocumentScannerOptions options = new GmsDocumentScannerOptions.Builder()
+                    .setGalleryImportAllowed(true)
+                    .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
+                    .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                    .build();
+            GmsDocumentScanning.getClient(options)
+                    .getStartScanIntent(this)
+                    .addOnSuccessListener(sender -> {
+                        try {
+                            startIntentSenderForResult(sender, REQ_GOOGLE_SCAN, null, 0, 0, 0);
+                        } catch (IntentSender.SendIntentException e) {
+                            notifyGoogleError("error", e.getMessage());
+                        }
+                    })
+                    .addOnFailureListener(e -> {
+                        String code = "error";
+                        if (e instanceof MlKitException) {
+                            int c = ((MlKitException) e).getErrorCode();
+                            if (c == MlKitException.UNSUPPORTED) code = "unsupported";
+                            else if (c == MlKitException.UNAVAILABLE) code = "unavailable";
+                        }
+                        notifyGoogleError(code, e.getMessage());
+                    });
+        } catch (Throwable t) {
+            // Sin Google Play services o librería no disponible en este teléfono
+            notifyGoogleError("unsupported", t.getMessage());
+        }
+    }
+
+    private void handleGoogleScan(int resultCode, Intent data) {
+        scanUris.clear();
+        if (resultCode == RESULT_OK && data != null) {
+            try {
+                GmsDocumentScanningResult result = GmsDocumentScanningResult.fromActivityResultIntent(data);
+                if (result != null && result.getPages() != null) {
+                    for (GmsDocumentScanningResult.Page page : result.getPages()) scanUris.add(page.getImageUri());
+                }
+            } catch (Exception e) {
+                notifyGoogleError("error", e.getMessage());
+                return;
+            }
+        }
+        // Lista vacía = la persona canceló
+        JSONArray arr = new JSONArray();
+        long t = System.currentTimeMillis();
+        for (int k = 0; k < scanUris.size(); k++) arr.put("/escaneo/" + k + "?t=" + t);
+        final String js = "window.onGoogleScan && window.onGoogleScan(" + arr + ")";
+        runOnUiThread(() -> webView.evaluateJavascript(js, null));
+    }
+
+    private void notifyGoogleError(String code, String message) {
+        String msg = message == null ? "" : message.replace("\\", " ").replace("'", " ").replace("\n", " ");
+        final String js = "window.onGoogleScanError && window.onGoogleScanError('" + code + "', '" + msg + "')";
+        runOnUiThread(() -> webView.evaluateJavascript(js, null));
     }
 
     /* ---------------- imágenes compartidas desde otras apps ---------------- */
@@ -263,6 +341,12 @@ public class MainActivity extends Activity {
         if (!HOST.equals(url.getHost()) || url.getPath() == null) return null;
         String path = url.getPath();
         try {
+            if (path.startsWith("/escaneo/")) {
+                int idx = Integer.parseInt(path.substring("/escaneo/".length()));
+                if (idx < 0 || idx >= scanUris.size()) return notFound();
+                InputStream in = getContentResolver().openInputStream(scanUris.get(idx));
+                return new WebResourceResponse("image/jpeg", null, in);
+            }
             if (path.startsWith("/entrada/")) {
                 int idx = Integer.parseInt(path.substring("/entrada/".length()));
                 if (idx < 0 || idx >= sharedUris.size()) return notFound();
@@ -410,6 +494,12 @@ public class MainActivity extends Activity {
                     toast("No hay una app para abrir este archivo");
                 }
             });
+        }
+
+        /** Abre el escáner de documentos de Google. Responde por onGoogleScan / onGoogleScanError. */
+        @JavascriptInterface
+        public void scanWithGoogle() {
+            runOnUiThread(MainActivity.this::launchGoogleScanner);
         }
 
         /** Mantiene la pantalla encendida mientras la cámara está abierta. */

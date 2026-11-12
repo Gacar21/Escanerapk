@@ -10,6 +10,7 @@ const PREVIEW_SIDE = 900;  // vista previa inmediata al cambiar de filtro
 const MAX_OUTPUT = 2400;   // lado mayor de la página escaneada (≈ 290 ppp en A4)
 const JPEG_QUALITY = 0.88;
 const FILTER_KEY = 'escaner.filtro';
+const GOOGLE_KEY = 'escaner.google'; // 'off' si el escáner de Google no funciona en este teléfono
 
 let filterPref = 'mejorado';
 try { filterPref = localStorage.getItem(FILTER_KEY) || 'mejorado'; } catch { /* sin almacenamiento */ }
@@ -194,8 +195,98 @@ const renderImage = (key, quad, filter, rotation, maxSide) =>
 let edit = null; // { doc, page, canvas, srcBlob, quad, detected, rotation, filter, warped, filtered }
 let captureTarget = null; // documento al que se agregan las páginas nuevas
 
+/* =================== escáner de Google =================== */
+//
+// Por defecto se usa el escáner de documentos de Google (detección con IA, captura
+// automática y recorte). Si el teléfono no lo soporta, se usa la cámara DECOM.
+
+const googleAvailable = () => {
+  if (!native || typeof native.scanWithGoogle !== 'function') return false;
+  try { return localStorage.getItem(GOOGLE_KEY) !== 'off'; } catch { return true; }
+};
+
+let googleTarget = null;  // documento al que se agregan las páginas escaneadas
+let googleWaiting = false;
+
 function startCapture(doc = null) {
+  if (!googleAvailable()) {
+    openCamera(doc);
+    return;
+  }
+  googleTarget = doc;
+  googleWaiting = true;
+  busy('Abriendo escáner…');
+  native.scanWithGoogle();
+  // si el escáner no llega a abrir, no dejar la pantalla bloqueada
+  setTimeout(() => {
+    if (googleWaiting && !document.hidden) {
+      googleWaiting = false;
+      busy(null);
+    }
+  }, 15000);
+}
+
+// Páginas listas desde el escáner de Google (ya recortadas y mejoradas)
+window.onGoogleScan = async (urls) => {
+  googleWaiting = false;
+  busy(null);
+  if (!urls || !urls.length) return; // canceló
+  await importScanned(urls, googleTarget);
+};
+
+window.onGoogleScanError = (code) => {
+  googleWaiting = false;
+  busy(null);
+  const doc = googleTarget;
+  if (code === 'unsupported') {
+    try { localStorage.setItem(GOOGLE_KEY, 'off'); } catch { /* sin almacenamiento */ }
+    toast('Este teléfono no tiene el escáner de Google; se usará la cámara DECOM');
+  } else if (code === 'unavailable') {
+    toast('El escáner de Google se está descargando. Mientras tanto, usa la cámara DECOM.');
+  } else {
+    toast('No se pudo abrir el escáner de Google; se usará la cámara DECOM');
+  }
   openCamera(doc);
+};
+
+/**
+ * Guarda las páginas que entregó el escáner de Google. Ya vienen recortadas y
+ * mejoradas, así que no se vuelven a procesar: se guardan tal cual (filtro "Original").
+ * Si luego la persona quiere, puede reajustarlas o cambiar el filtro desde el documento.
+ */
+async function importScanned(urls, doc) {
+  doc = doc || (await createDoc());
+  let failed = 0;
+  for (let i = 0; i < urls.length; i++) {
+    busy(`Guardando página ${i + 1} de ${urls.length}…`);
+    try {
+      const blob = await fetch(urls[i]).then((r) => {
+        if (!r.ok) throw new Error('No se pudo leer la página');
+        return r.blob();
+      });
+      const { canvas, srcBlob } = await prepareSource(blob);
+      const out = {
+        blob: srcBlob,
+        thumb: await canvasToBlob(scaled(canvas, 420), 'image/jpeg', 0.8),
+        width: canvas.width,
+        height: canvas.height,
+      };
+      await persistPage(doc, null, {
+        srcBlob,
+        quad: defaultQuad(canvas.width, canvas.height, 0),
+        filter: 'original',
+        rotation: 0,
+        out,
+      });
+    } catch (err) {
+      console.error(err);
+      failed++;
+    }
+  }
+  busy(null);
+  await openDoc(doc);
+  const ok = urls.length - failed;
+  toast(failed ? `${ok} de ${urls.length} páginas guardadas` : `${ok} página${ok === 1 ? '' : 's'} escaneada${ok === 1 ? '' : 's'}`);
 }
 
 function startImport(doc = null) {
@@ -1221,6 +1312,8 @@ async function goHome() {
 }
 
 $('btnScan').addEventListener('click', () => startCapture(null));
+$('btnOwnCamera').addEventListener('click', () => openCamera(null));
+$('btnOwnCamera').hidden = !googleAvailable();
 $('btnImport').addEventListener('click', () => startImport(null));
 
 /* =================== botón atrás de Android =================== */
